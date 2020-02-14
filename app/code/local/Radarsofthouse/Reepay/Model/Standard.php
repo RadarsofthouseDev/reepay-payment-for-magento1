@@ -16,6 +16,7 @@ class Radarsofthouse_Reepay_Model_Standard extends Mage_Payment_Model_Method_Abs
     protected $_canUseInternal = true;
     protected $_canUseForMultishipping = false;
     protected $_canCapture = true;
+    protected $_canVoid = true;
     protected $_canRefund = true;
     protected $_isGateway = true;
     protected $_canCapturePartial = true;
@@ -82,58 +83,124 @@ class Radarsofthouse_Reepay_Model_Standard extends Mage_Payment_Model_Method_Abs
      */
     public function capture(Varien_Object $payment, $amount)
     {
-        $order = $payment->getOrder();
-        $amount = $amount;
-        $adminSession = Mage::getSingleton('adminhtml/session');
+        parent::capture($payment, $amount);
 
-        if ($adminSession->getLatestCapturedInvoice()->getOrderId() == $order->getId()) {
-            Mage::helper('reepay')->log("ADMIN capture : ".$order->getIncrementId());
-            
-            $orderInvoices = $order->getInvoiceCollection();
-            $invoice = $adminSession->getLatestCapturedInvoice();
-            $options = array();
-            $options['key'] = count($orderInvoices);
-            $options['amount'] = $amount*100;
-            $options['ordertext'] = "settled";
-            // $orderLines = $this->getOrderLinesFromInvoice($invoice);
-            // $options['order_lines'] = $orderLines;
-
-            $apiKey = Mage::helper('reepay/apikey')->getPrivateKey($order->getStoreId());
-            $charge = Mage::helper('reepay/charge')->settle($apiKey, $order->getIncrementId(), $options);
-            if (!empty($charge)) {
-                if ($charge['state'] == 'settled') {
-                    $_payment = $order->getPayment();
-                    Mage::helper('reepay')->setReepayPaymentState($_payment, 'settled');
-                    $order->save();
-
-                    // separate transactions for partial capture
-                    $payment->setIsTransactionClosed(false);
-                    $payment->setTransactionId($charge['transaction']);
-                    $transactionData = array(
-                        'handle' => $charge['handle'],
-                        'transaction' => $charge['transaction'],
-                        'state' => $charge['state'],
-                        'amount' => $amount,
-                        'customer' => $charge['customer'],
-                        'currency' => $charge['currency'],
-                        'created' => $charge['created'],
-                        'authorized' => $charge['authorized'],
-                        'settled' => $charge['settled']
-                    );
-                    $payment->setTransactionAdditionalInfo(
-                        Mage_Sales_Model_Order_Payment_Transaction::RAW_DETAILS,
-                        $transactionData
-                    );
-                    Mage::helper('reepay')->log("set capture transaction data");
-                } else {
-                    Mage::helper('reepay')->log("Charge state is not settled", Zend_Log::ERR);
-                }
-            }
-        } else {
-            Mage::helper('reepay')->log('ADMIN capture action : Wrong captured invoice data', Zend_Log::ERR);
+        if ($amount <= 0) {
+            Mage::throwException(Mage::helper('paygate')->__('Invalid amount for capture.'));
         }
- 
+
+        $payment->setAmount($amount);
+
+        $order = $payment->getOrder();
+        Mage::helper('reepay')->log("ADMIN capture : " . $order->getIncrementId());
+
+        $options = array(
+            'key' => uniqid(),
+            'amount' => $amount * 100,
+            'ordertext' => 'settled',
+            //'order_lines' => $this->getOrderLinesFromInvoice($invoice),
+        );
+
+        // Don't pass amount if there's full invoicing
+        if ((float) $order->getGrandTotal() === (float) $amount) {
+            $options = array(
+                'key' => uniqid()
+            );
+        }
+
+        $apiKey = Mage::helper('reepay/apikey')->getPrivateKey($order->getStoreId());
+        $charge = Mage::helper('reepay/charge')->settle($apiKey, $order->getIncrementId(), $options);
+
+        if (empty($charge) || $charge['state'] !== 'settled') {
+            Mage::helper('reepay')->log("Charge state is not settled", Zend_Log::ERR);
+            Mage::throwException(Mage::helper('reepay')->__('Charge state is not settled'));
+        }
+
+        Mage::helper('reepay')->setReepayPaymentState($order->getPayment(), 'settled');
+        $order->save();
+
+        // Add Transaction
+        $payment->setStatus(self::STATUS_APPROVED)
+                ->setTransactionId($charge['transaction'])
+                ->setIsTransactionClosed(0);
+
+        // Add Transaction fields
+        $payment->setTransactionAdditionalInfo(
+            Mage_Sales_Model_Order_Payment_Transaction::RAW_DETAILS,
+            array(
+                'handle' => $charge['handle'],
+                'transaction' => $charge['transaction'],
+                'state' => $charge['state'],
+                'amount' => $amount,
+                'customer' => $charge['customer'],
+                'currency' => $charge['currency'],
+                'created' => $charge['created'],
+                'authorized' => $charge['authorized'],
+                'settled' => $charge['settled']
+            )
+        );
+
+        Mage::helper('reepay')->log("set capture transaction data");
+
         return $this;
+    }
+
+    /**
+     * Cancel payment
+     *
+     * @param   Varien_Object $payment
+     * @return  $this
+     */
+    public function cancel(Varien_Object $payment)
+    {
+        parent::cancel($payment);
+
+        $order = $payment->getOrder();
+        Mage::helper('reepay')->log("ADMIN cancel : " . $order->getIncrementId());
+
+        $apiKey = Mage::helper('reepay/apikey')->getPrivateKey($order->getStoreId());
+        $cancel = Mage::helper('reepay/charge')->cancel($apiKey, $order->getIncrementId());
+
+        if (empty($cancel) || $cancel['state'] !== 'cancelled') {
+            Mage::helper('reepay')->log("State is not cancelled", Zend_Log::ERR);
+            Mage::throwException(Mage::helper('reepay')->__('Cancellation is failed'));
+        }
+
+        // Add Cancel Transaction
+        $payment->setStatus(self::STATUS_DECLINED)
+                ->setTransactionId($cancel['transaction'] . '-cancel')
+                ->setIsTransactionClosed(1); // Closed
+
+        // Add Transaction fields
+        $payment->setAdditionalInformation(
+            Mage_Sales_Model_Order_Payment_Transaction::RAW_DETAILS,
+            array(
+                'handle' => $cancel['handle'],
+                'transaction' => $cancel['transaction'],
+                'state' => $cancel['state'],
+                'amount' => $cancel['amount'],
+                'customer' => $cancel['customer'],
+                'currency' => $cancel['currency'],
+                'created' => $cancel['created'],
+                'authorized' => $cancel['authorized'],
+                'cancelled' => $cancel['cancelled']
+            )
+        );
+
+        Mage::helper('reepay')->setReepayPaymentState($order->getPayment(), 'cancelled');
+
+        return $this;
+    }
+
+    /**
+     * Void payment
+     *
+     * @param Varien_Object $payment
+     * @return $this
+     */
+    public function void(Varien_Object $payment)
+    {
+        return $this->cancel($payment);
     }
 
     /**
@@ -210,5 +277,32 @@ class Radarsofthouse_Reepay_Model_Standard extends Mage_Payment_Model_Method_Abs
         }
 
         return $this;
+    }
+
+    /**
+     * Check void availability
+     *
+     * @param   Varien_Object $payment
+     * @return  bool
+     */
+    public function canVoid(Varien_Object $payment)
+    {
+        if ($payment instanceof Mage_Sales_Model_Order_Invoice
+            || $payment instanceof Mage_Sales_Model_Order_Creditmemo
+        ) {
+            return false;
+        }
+
+        return $this->_canVoid;
+    }
+
+    /**
+     * Can be edit order (renew order)
+     *
+     * @return bool
+     */
+    public function canEdit()
+    {
+        return false;
     }
 }
